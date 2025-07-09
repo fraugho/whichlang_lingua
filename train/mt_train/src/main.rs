@@ -18,7 +18,7 @@ pub struct TrainingConfig {
     pub train_test_split: f32, // 0.8 means 80% training, 20% testing
     pub batch_size: usize,
     pub early_stopping_patience: usize,
-    pub samples_per_language: usize, // New: equal samples per language
+    pub samples_per_language: usize,
 }
 
 impl Default for TrainingConfig {
@@ -31,7 +31,7 @@ impl Default for TrainingConfig {
             train_test_split: 0.8,
             batch_size: 32,
             early_stopping_patience: 10,
-            samples_per_language: 1000, // Default to 1000 samples per language
+            samples_per_language: 1000,
         }
     }
 }
@@ -713,7 +713,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     trainer.train(&training_data);
     
     // Export results
-    trainer.export_weights("weights_balanced.hpp")?;
+    trainer.export_weights("../../cpp/weights_balanced.hpp")?;
     
     println!("Egalitarian training completed successfully!");
     Ok(())
