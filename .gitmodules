@@ -1,0 +1,3 @@
+[submodule "lingua"]
+	path = lingua
+	url = https://github.com/pemistahl/lingua-py.git
