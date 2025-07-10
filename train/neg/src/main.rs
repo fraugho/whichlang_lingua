@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{File, read_dir};
-use std::io::{BufRead, BufReader, Write, stdin};
+use std::io::{stdin, BufRead, BufReader, Read, Write};
 use std::error::Error;
 use std::time::Instant;
 use std::path::Path;
@@ -419,17 +419,41 @@ impl LanguageDetectorTrainer {
                 total_loss += loss;
                 processed += 1;
 
+                // Find the top-2 incorrect predictions (highest probabilities excluding correct answer)
+                let mut prob_with_idx: Vec<(usize, f32)> = probabilities.iter()
+                    .enumerate()
+                    .filter(|(idx, _)| *idx != target_idx)  // Exclude correct answer
+                    .map(|(idx, &prob)| (idx, prob))
+                    .collect();
+                
+                // Sort by probability (highest first)
+                prob_with_idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                
+                // Get top-2 incorrect predictions
+                let top_incorrect_indices: Vec<usize> = prob_with_idx.iter()
+                    .take(2)
+                    .map(|(idx, _)| *idx)
+                    .collect();
+
+                // Penalty factor for top-2 incorrect predictions
+                let penalty_factor = 1.5; // Increase gradient for top-2 incorrect by 50%
+
                 // Gradient descent
                 for (&bucket, &feature_count) in &features {
                     let weight_start = bucket as usize * self.language_codes.len();
                     
                     for (lang_idx, &prob) in probabilities.iter().enumerate() {
                         if weight_start + lang_idx < self.weights.len() {
-                            let gradient = if lang_idx == target_idx {
+                            let mut gradient = if lang_idx == target_idx {
                                 feature_count * (prob - 1.0)
                             } else {
                                 feature_count * prob
                             };
+                            
+                            // Apply penalty to top-2 incorrect predictions
+                            if top_incorrect_indices.contains(&lang_idx) {
+                                gradient *= penalty_factor;
+                            }
                             
                             // Update with L2 regularization
                             let weight_idx = weight_start + lang_idx;
@@ -439,13 +463,18 @@ impl LanguageDetectorTrainer {
                     }
                 }
 
-                // Update intercepts
+                // Update intercepts with penalty
                 for (lang_idx, &prob) in probabilities.iter().enumerate() {
-                    let gradient = if lang_idx == target_idx {
+                    let mut gradient = if lang_idx == target_idx {
                         prob - 1.0
                     } else {
                         prob
                     };
+                    
+                    // Apply penalty to top-2 incorrect predictions
+                    if top_incorrect_indices.contains(&lang_idx) {
+                        gradient *= penalty_factor;
+                    }
                     
                     self.intercepts[lang_idx] -= self.config.learning_rate * gradient;
                 }
@@ -711,7 +740,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     println!("\nStarting egalitarian training...");
     trainer.train(&training_data);
-    
+
     println!("Set file name");
     let mut buf = String::new();
     let stdin = stdin();
