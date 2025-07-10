@@ -1,14 +1,12 @@
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, read_dir};
 use std::io::{BufRead, BufReader, Write};
 use std::error::Error;
 use std::time::Instant;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::path::Path;
 use rand::seq::SliceRandom;
 use rand::rng;
-use csv::Reader;
-use rayon::prelude::*;
+use rand::prelude::IndexedMutRandom;
 
 // Configuration for training
 #[derive(Debug, Clone)]
@@ -17,10 +15,10 @@ pub struct TrainingConfig {
     pub epochs: usize,
     pub regularization: f32,
     pub dimension: usize,
-    pub train_test_split: f32,
+    pub train_test_split: f32, // 0.8 means 80% training, 20% testing
     pub batch_size: usize,
     pub early_stopping_patience: usize,
-    pub num_threads: usize, // New field for thread count
+    pub samples_per_language: usize,
 }
 
 impl Default for TrainingConfig {
@@ -33,13 +31,13 @@ impl Default for TrainingConfig {
             train_test_split: 0.8,
             batch_size: 32,
             early_stopping_patience: 10,
-            num_threads: num_cpus::get(), // Auto-detect CPU count
+            samples_per_language: 1000,
         }
     }
 }
 
 // Training example
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct TrainingExample {
     pub id: u32,
     pub lan_code: String,
@@ -162,14 +160,6 @@ fn format_duration(seconds: f64) -> String {
     }
 }
 
-// Batch processing result
-#[derive(Debug)]
-struct BatchResult {
-    loss: f32,
-    weight_updates: Vec<(usize, f32)>, // (index, gradient)
-    intercept_updates: Vec<(usize, f32)>, // (index, gradient)
-}
-
 // Main trainer struct
 pub struct LanguageDetectorTrainer {
     pub language_codes: Vec<String>,
@@ -194,16 +184,6 @@ impl LanguageDetectorTrainer {
             .map(|_| (rand::random::<f32>() - 0.5) * 0.01)
             .collect();
 
-        // Set up thread pool for rayon
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(config.num_threads)
-            .build_global()
-            .unwrap_or_else(|_| {
-                eprintln!("Warning: Could not set thread pool size, using default");
-            });
-
-        println!("Using {} threads for parallel processing", config.num_threads);
-
         Self {
             language_codes,
             language_names,
@@ -213,19 +193,161 @@ impl LanguageDetectorTrainer {
         }
     }
 
-    // Load training data from CSV
-    pub fn load_csv_data(file_path: &str) -> Result<Vec<TrainingExample>, Box<dyn Error>> {
-        let mut file = Reader::from_path(file_path)?;
+    // MODIFIED: Load training data from single-words folder only
+    pub fn load_folder_data(base_path: &str) -> Result<Vec<TrainingExample>, Box<dyn Error>> {
         let mut examples = Vec::new();
-        for result in file.deserialize() {
-            let record: TrainingExample = result?;
-            examples.push(record);
+        let mut id_counter = 0u32;
+        
+        // Only load from single-words subdirectory
+        let single_words_dir = Path::new(base_path).join("single-words");
+        println!("Loading single-word data from: {}", single_words_dir.display());
+        
+        if !single_words_dir.exists() {
+            return Err(format!("Single-words directory {} does not exist", single_words_dir.display()).into());
         }
-        println!("Loaded {} training examples", examples.len());
+        
+        // Read all .txt files in the single-words subdirectory
+        for entry in read_dir(&single_words_dir)? {
+            let entry = entry?;
+            let file_path = entry.path();
+            
+            if let Some(extension) = file_path.extension() {
+                if extension == "txt" {
+                    if let Some(file_stem) = file_path.file_stem() {
+                        if let Some(lang_code) = file_stem.to_str() {
+                            // Load examples from this file
+                            let file_examples = Self::load_language_file(&file_path, lang_code, &mut id_counter)?;
+                            let examples_count = file_examples.len();
+                            examples.extend(file_examples);
+                            println!("  Loaded {} single words from {}", 
+                                    examples_count, file_path.display());
+                        }
+                    }
+                }
+            }
+        }
+        
+        println!("Total loaded {} single-word training examples", examples.len());
         Ok(examples)
     }
 
-    // Extract features from text (thread-safe)
+    // Helper function to load examples from a single language file
+    fn load_language_file(file_path: &Path, lang_code: &str, id_counter: &mut u32) -> Result<Vec<TrainingExample>, Box<dyn Error>> {
+        let file = File::open(file_path)?;
+        let reader = BufReader::new(file);
+        let mut examples = Vec::new();
+        
+        for line in reader.lines() {
+            let word = line?.trim().to_string();
+            if !word.is_empty() {
+                // Additional validation: ensure it's actually a single word (no spaces)
+                if !word.contains(' ') {
+                    examples.push(TrainingExample {
+                        id: *id_counter,
+                        lan_code: lang_code.to_string(),
+                        sentence: word, // Using 'sentence' field for single words
+                    });
+                    *id_counter += 1;
+                }
+            }
+        }
+        
+        Ok(examples)
+    }
+
+    // Create balanced dataset with equal samples per language
+    pub fn create_balanced_dataset(&self, data: &[TrainingExample]) -> Vec<TrainingExample> {
+        let mut rng = rng();
+        let mut lang_data: HashMap<String, Vec<TrainingExample>> = HashMap::new();
+        
+        // Group data by language
+        for example in data {
+            lang_data.entry(example.lan_code.clone())
+                .or_insert_with(Vec::new)
+                .push(example.clone());
+        }
+
+        let mut balanced_data = Vec::new();
+        let mut total_samples = 0;
+        let mut upsampled_languages = Vec::new();
+        let mut downsampled_languages = Vec::new();
+
+        println!("\nCreating balanced dataset with {} single words per language:", self.config.samples_per_language);
+        
+        for lang_code in &self.language_codes {
+            if let Some(examples) = lang_data.get_mut(lang_code) {
+                let original_count = examples.len();
+                
+                if original_count >= self.config.samples_per_language {
+                    // Downsample: randomly select samples
+                    examples.shuffle(&mut rng);
+                    examples.truncate(self.config.samples_per_language);
+                    downsampled_languages.push((lang_code.clone(), original_count));
+                } else {
+                    // Upsample: duplicate examples with slight variations
+                    let mut upsampled = Vec::new();
+                    let needed = self.config.samples_per_language;
+                    
+                    // First add all original examples
+                    upsampled.extend_from_slice(examples);
+                    
+                    // Then duplicate randomly to reach target
+                    while upsampled.len() < needed {
+                        let random_example = examples.choose_mut(&mut rng).unwrap().clone();
+                        upsampled.push(random_example);
+                    }
+                    
+                    // Ensure exact count
+                    upsampled.truncate(needed);
+                    *examples = upsampled;
+                    upsampled_languages.push((lang_code.clone(), original_count));
+                }
+                
+                balanced_data.extend_from_slice(examples);
+                total_samples += examples.len();
+                
+                let lang_name = self.language_names.get(lang_code).unwrap_or(lang_code);
+                println!("  {}: {} -> {} single words ({})", 
+                        lang_code, original_count, examples.len(), lang_name);
+            }
+        }
+
+        println!("\nBalancing summary:");
+        println!("  Total languages: {}", self.language_codes.len());
+        println!("  Total single words: {} ({}k per language)", total_samples, self.config.samples_per_language);
+        println!("  Upsampled languages: {}", upsampled_languages.len());
+        println!("  Downsampled languages: {}", downsampled_languages.len());
+        
+        if !upsampled_languages.is_empty() {
+            println!("\nUpsampled languages (original -> target):");
+            for (lang, original) in &upsampled_languages {
+                let lang_name = self.language_names.get(lang).unwrap_or(lang);
+                println!("  {}: {} -> {} ({})", lang, original, self.config.samples_per_language, lang_name);
+            }
+        }
+        
+        if !downsampled_languages.is_empty() {
+            println!("\nDownsampled languages (original -> target):");
+            for (lang, original) in &downsampled_languages {
+                let lang_name = self.language_names.get(lang).unwrap_or(lang);
+                println!("  {}: {} -> {} ({})", lang, original, self.config.samples_per_language, lang_name);
+            }
+        }
+
+        // Final shuffle
+        balanced_data.shuffle(&mut rng);
+        balanced_data
+    }
+
+    // Helper function to convert language code to C++ enum name
+    fn lang_code_to_cpp_enum(code: &str) -> String {
+        // Convert language code to enum variant (capitalize first letter)
+        code.chars()
+            .enumerate()
+            .map(|(i, c)| if i == 0 { c.to_uppercase().collect::<String>() } else { c.to_string() })
+            .collect::<String>()
+    }
+    
     pub fn extract_features(&self, text: &str) -> HashMap<u32, f32> {
         let mut feature_counts = HashMap::new();
         let mut total_features = 0u32;
@@ -237,7 +359,7 @@ impl LanguageDetectorTrainer {
             *feature_counts.entry(bucket).or_insert(0.0) += 1.0;
         });
 
-        // Normalize by sqrt of total features
+        // Normalize by sqrt of total features (matching original code)
         if total_features > 0 {
             let norm_factor = 1.0 / (total_features as f32).sqrt();
             for count in feature_counts.values_mut() {
@@ -248,7 +370,7 @@ impl LanguageDetectorTrainer {
         feature_counts
     }
 
-    // Predict language scores (thread-safe)
+    // Predict language scores
     pub fn predict(&self, features: &HashMap<u32, f32>) -> Vec<f32> {
         let mut scores = self.intercepts.clone();
         
@@ -264,7 +386,7 @@ impl LanguageDetectorTrainer {
         scores
     }
 
-    // Softmax function (thread-safe)
+    // Softmax function
     pub fn softmax(scores: &[f32]) -> Vec<f32> {
         let max_score = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
         let exp_scores: Vec<f32> = scores.iter().map(|&s| (s - max_score).exp()).collect();
@@ -276,35 +398,29 @@ impl LanguageDetectorTrainer {
         }
     }
 
-    // Process a batch of examples in parallel
-    pub fn process_batch_parallel(&self, examples: &[TrainingExample]) -> BatchResult {
-        let language_codes = &self.language_codes;
-        let config = &self.config;
-        
-        // Process examples in parallel using rayon
-        let results: Vec<_> = examples.par_iter()
-            .filter_map(|example| {
-                // Find target language index
-                let target_idx = language_codes.iter().position(|code| code == &example.lan_code)?;
-                
-                // Extract features
+    // Training step
+    pub fn train_step(&mut self, examples: &[TrainingExample]) -> f32 {
+        let mut total_loss = 0.0;
+        let mut processed = 0;
+
+        for example in examples {
+            if let Some(target_idx) = self.language_codes.iter().position(|code| code == &example.lan_code) {
                 let features = self.extract_features(&example.sentence);
                 if features.is_empty() {
-                    return None;
+                    continue;
                 }
 
-                // Predict and calculate loss
                 let scores = self.predict(&features);
                 let probabilities = Self::softmax(&scores);
+                
+                // Cross-entropy loss
                 let loss = -probabilities[target_idx].max(1e-10).ln();
+                total_loss += loss;
+                processed += 1;
 
-                // Calculate gradients
-                let mut weight_gradients = Vec::new();
-                let mut intercept_gradients = Vec::new();
-
-                // Weight gradients
+                // Gradient descent
                 for (&bucket, &feature_count) in &features {
-                    let weight_start = bucket as usize * language_codes.len();
+                    let weight_start = bucket as usize * self.language_codes.len();
                     
                     for (lang_idx, &prob) in probabilities.iter().enumerate() {
                         if weight_start + lang_idx < self.weights.len() {
@@ -314,12 +430,15 @@ impl LanguageDetectorTrainer {
                                 feature_count * prob
                             };
                             
-                            weight_gradients.push((weight_start + lang_idx, gradient));
+                            // Update with L2 regularization
+                            let weight_idx = weight_start + lang_idx;
+                            let reg_term = self.config.regularization * self.weights[weight_idx];
+                            self.weights[weight_idx] -= self.config.learning_rate * (gradient + reg_term);
                         }
                     }
                 }
 
-                // Intercept gradients
+                // Update intercepts
                 for (lang_idx, &prob) in probabilities.iter().enumerate() {
                     let gradient = if lang_idx == target_idx {
                         prob - 1.0
@@ -327,77 +446,35 @@ impl LanguageDetectorTrainer {
                         prob
                     };
                     
-                    intercept_gradients.push((lang_idx, gradient));
+                    self.intercepts[lang_idx] -= self.config.learning_rate * gradient;
                 }
-
-                Some((loss, weight_gradients, intercept_gradients))
-            })
-            .collect();
-
-        // Aggregate results
-        let mut total_loss = 0.0;
-        let mut weight_updates: HashMap<usize, f32> = HashMap::new();
-        let mut intercept_updates: HashMap<usize, f32> = HashMap::new();
-
-        for (loss, weight_grads, intercept_grads) in results {
-            total_loss += loss;
-            
-            // Accumulate weight gradients
-            for (idx, grad) in weight_grads {
-                *weight_updates.entry(idx).or_insert(0.0) += grad;
-            }
-            
-            // Accumulate intercept gradients
-            for (idx, grad) in intercept_grads {
-                *intercept_updates.entry(idx).or_insert(0.0) += grad;
             }
         }
 
-        BatchResult {
-            loss: total_loss,
-            weight_updates: weight_updates.into_iter().collect(),
-            intercept_updates: intercept_updates.into_iter().collect(),
-        }
-    }
-
-    // Training step with parallel processing
-    pub fn train_step_parallel(&mut self, examples: &[TrainingExample]) -> f32 {
-        let batch_result = self.process_batch_parallel(examples);
-        
-        // Apply weight updates with L2 regularization
-        for (idx, gradient) in batch_result.weight_updates {
-            let reg_term = self.config.regularization * self.weights[idx];
-            self.weights[idx] -= self.config.learning_rate * (gradient + reg_term);
-        }
-        
-        // Apply intercept updates
-        for (idx, gradient) in batch_result.intercept_updates {
-            self.intercepts[idx] -= self.config.learning_rate * gradient;
-        }
-        
-        // Return average loss
-        let processed_examples = examples.len();
-        if processed_examples > 0 {
-            batch_result.loss / processed_examples as f32
+        if processed > 0 {
+            total_loss / processed as f32
         } else {
             0.0
         }
     }
 
-    // Full training loop with parallel processing
+    // Full training loop
     pub fn train(&mut self, training_data: &[TrainingExample]) {
         let mut rng = rng();
         let mut best_loss = f32::INFINITY;
         let mut patience_counter = 0;
 
-        // Split data
-        let mut shuffled_data = training_data.to_vec();
+        // Create balanced dataset first
+        let balanced_data = self.create_balanced_dataset(training_data);
+        
+        // Split balanced data
+        let mut shuffled_data = balanced_data;
         shuffled_data.shuffle(&mut rng);
         
         let split_idx = (shuffled_data.len() as f32 * self.config.train_test_split) as usize;
         let (train_data, test_data) = shuffled_data.split_at(split_idx);
         
-        println!("Training on {} examples, testing on {} examples", train_data.len(), test_data.len());
+        println!("\nTraining on {} single words, testing on {} single words", train_data.len(), test_data.len());
 
         let start_time = Instant::now();
 
@@ -406,12 +483,12 @@ impl LanguageDetectorTrainer {
             let mut epoch_data = train_data.to_vec();
             epoch_data.shuffle(&mut rng);
 
-            // Process in batches with parallel processing
+            // Process in batches
             let mut total_loss = 0.0;
             let mut num_batches = 0;
             
             for batch in epoch_data.chunks(self.config.batch_size) {
-                let loss = self.train_step_parallel(batch);
+                let loss = self.train_step(batch);
                 total_loss += loss;
                 num_batches += 1;
             }
@@ -426,7 +503,7 @@ impl LanguageDetectorTrainer {
             
             // Evaluate on test data every 10 epochs
             if epoch % 10 == 0 || epoch == self.config.epochs - 1 {
-                let test_accuracy = self.evaluate_parallel(test_data);
+                let test_accuracy = self.evaluate(test_data);
                 println!("Epoch {}: Avg Loss = {:.4}, Test Accuracy = {:.2}% | ETA: {}", 
                         epoch + 1, avg_loss, test_accuracy * 100.0, format_duration(eta_seconds));
             } else {
@@ -451,13 +528,14 @@ impl LanguageDetectorTrainer {
         println!("Training completed in {}", format_duration(total_time));
     }
 
-    // Parallel evaluation
-    pub fn evaluate_parallel(&self, test_data: &[TrainingExample]) -> f32 {
-        let results: Vec<_> = test_data.par_iter()
-            .filter_map(|example| {
-                let target_idx = self.language_codes.iter().position(|code| code == &example.lan_code)?;
+    // Evaluate model
+    pub fn evaluate(&self, test_data: &[TrainingExample]) -> f32 {
+        let mut correct = 0;
+        let mut total = 0;
+
+        for example in test_data {
+            if let Some(target_idx) = self.language_codes.iter().position(|code| code == &example.lan_code) {
                 let features = self.extract_features(&example.sentence);
-                
                 if !features.is_empty() {
                     let scores = self.predict(&features);
                     let predicted_idx = scores.iter()
@@ -466,17 +544,13 @@ impl LanguageDetectorTrainer {
                         .map(|(idx, _)| idx)
                         .unwrap_or(0);
                     
-                    Some((predicted_idx == target_idx, 1))
-                } else {
-                    None
+                    if predicted_idx == target_idx {
+                        correct += 1;
+                    }
+                    total += 1;
                 }
-            })
-            .collect();
-
-        let (correct, total): (usize, usize) = results.iter()
-            .fold((0, 0), |(acc_correct, acc_total), &(is_correct, count)| {
-                (acc_correct + if is_correct { 1 } else { 0 }, acc_total + count)
-            });
+            }
+        }
 
         if total > 0 {
             correct as f32 / total as f32
@@ -485,55 +559,58 @@ impl LanguageDetectorTrainer {
         }
     }
 
-    // Keep original single-threaded methods for compatibility
-    pub fn evaluate(&self, test_data: &[TrainingExample]) -> f32 {
-        self.evaluate_parallel(test_data)
-    }
-
-    // Export weights to Rust file
+    // Export weights to C++ header file
     pub fn export_weights(&self, output_file: &str) -> Result<(), Box<dyn Error>> {
         let mut file = File::create(output_file)?;
         
-        writeln!(file, "// Auto-generated language detection weights")?;
+        writeln!(file, "// Auto-generated language detection weights for single words")?;
         writeln!(file, "// Generated from {} languages with {} features", 
                 self.language_codes.len(), self.config.dimension)?;
-        writeln!(file, "// Trained using {} threads", self.config.num_threads)?;
+        writeln!(file, "// Trained with {} single words per language (egalitarian)", 
+                self.config.samples_per_language)?;
+        writeln!(file, "#pragma once")?;
+        writeln!(file, "#include <array>")?;
+        writeln!(file, "#include <string>")?;
         writeln!(file)?;
 
         // Generate enum for languages
-        writeln!(file, "#[derive(Copy, Clone, Debug, Eq, PartialEq)]")?;
-        writeln!(file, "pub enum Lang {{")?;
+        writeln!(file, "enum class Lang {{")?;
         for code in &self.language_codes {
-            // Convert language code to enum variant (capitalize first letter)
-            let enum_name = code.chars()
-                .enumerate()
-                .map(|(i, c)| if i == 0 { c.to_uppercase().collect::<String>() } else { c.to_string() })
-                .collect::<String>();
+            let enum_name = Self::lang_code_to_cpp_enum(code);
             writeln!(file, "    {},  // {}", enum_name, 
                     self.language_names.get(code).unwrap_or(code))?;
         }
+        writeln!(file, "}};")?;
+        writeln!(file)?;
+
+        // Generate three_letter_code function
+        writeln!(file, "std::string three_letter_code(Lang language) {{")?;
+        writeln!(file, "    switch (language) {{")?;
+        for code in &self.language_codes {
+            let enum_name = Self::lang_code_to_cpp_enum(code);
+            writeln!(file, "        case Lang::{}: return \"{}\";", enum_name, code)?;
+        }
+        writeln!(file, "    }}")?;
+        writeln!(file, "    return \"unknown\";")?;
         writeln!(file, "}}")?;
         writeln!(file)?;
 
         // Generate languages array
-        writeln!(file, "pub const LANGUAGES: &[Lang] = &[")?;
+        writeln!(file, "const std::array<Lang, {}> LANGUAGES = {{", self.language_codes.len())?;
         for code in &self.language_codes {
-            let enum_name = code.chars()
-                .enumerate()
-                .map(|(i, c)| if i == 0 { c.to_uppercase().collect::<String>() } else { c.to_string() })
-                .collect::<String>();
+            let enum_name = Self::lang_code_to_cpp_enum(code);
             writeln!(file, "    Lang::{},", enum_name)?;
         }
-        writeln!(file, "];")?;
+        writeln!(file, "}};")?;
         writeln!(file)?;
 
         // Generate weights array
-        writeln!(file, "pub const WEIGHTS: &[f32] = &[")?;
+        writeln!(file, "const std::array<float, {}> WEIGHTS = {{", self.weights.len())?;
         for (i, &weight) in self.weights.iter().enumerate() {
             if i % 8 == 0 {
                 write!(file, "    ")?;
             }
-            write!(file, "{:.8}", weight)?;
+            write!(file, "{:.6}f", weight)?;
             if i < self.weights.len() - 1 {
                 write!(file, ",")?;
             }
@@ -543,21 +620,28 @@ impl LanguageDetectorTrainer {
                 write!(file, " ")?;
             }
         }
-        writeln!(file, "];")?;
+        writeln!(file, "}};")?;
         writeln!(file)?;
 
         // Generate intercepts array
-        writeln!(file, "pub const INTERCEPTS: &[f32] = &[")?;
+        writeln!(file, "const float INTERCEPTS[{}] = {{", self.intercepts.len())?;
         for (i, &intercept) in self.intercepts.iter().enumerate() {
-            write!(file, "    {:.8}", intercept)?;
+            if i % 8 == 0 {
+                write!(file, "    ")?;
+            }
+            write!(file, "{:.6}f", intercept)?;
             if i < self.intercepts.len() - 1 {
                 write!(file, ",")?;
             }
-            writeln!(file)?;
+            if i % 8 == 7 || i == self.intercepts.len() - 1 {
+                writeln!(file)?;
+            } else {
+                write!(file, " ")?;
+            }
         }
-        writeln!(file, "];")?;
+        writeln!(file, "}};")?;
 
-        println!("Weights exported to {}", output_file);
+        println!("Single-word weights exported to {}", output_file);
         Ok(())
     }
 
@@ -568,64 +652,81 @@ impl LanguageDetectorTrainer {
             *lang_counts.entry(example.lan_code.clone()).or_insert(0) += 1;
         }
 
-        println!("\nLanguage distribution in dataset:");
+        println!("\nOriginal single-word distribution in dataset:");
         let mut sorted_langs: Vec<_> = lang_counts.iter().collect();
         sorted_langs.sort_by(|a, b| b.1.cmp(a.1));
         
-        for (code, count) in sorted_langs {
-            let name = self.language_names.get(code).unwrap_or(code);
-            println!("  {}: {} ({} examples)", code, name, count);
+        for (code, count) in sorted_langs.iter().take(20) { // Show top 20
+            let name = self.language_names.get(*code).unwrap_or(code);
+            println!("  {}: {} ({} single words)", code, name, count);
+        }
+        
+        if sorted_langs.len() > 20 {
+            println!("  ... and {} more languages", sorted_langs.len() - 20);
         }
     }
 }
 
 // Main function to run training
 fn main() -> Result<(), Box<dyn Error>> {
-    // Load language mappings
-    let language_names = load_language_mappings("../dataset/lan_to_language.json")?;
+    // Load language codes from text file
+    let language_codes = load_language_codes("../../language_codes.txt")?;
     
-    // Load training data
-    let training_data = LanguageDetectorTrainer::load_csv_data("../dataset/sentences.csv")?;
-    
-    // Get unique language codes from data
-    let mut language_codes: Vec<String> = training_data.iter()
-        .map(|ex| ex.lan_code.clone())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
+    // Create a simple mapping from codes to codes (since we only have codes)
+    let language_names: HashMap<String, String> = language_codes.iter()
+        .map(|code| (code.clone(), code.clone()))
         .collect();
-    language_codes.sort();
     
-    println!("Found {} unique languages", language_codes.len());
+    // Load training data from single-words folder only
+    let training_data = LanguageDetectorTrainer::load_folder_data("../../lingua/language-testdata")?;
+    
+    // Filter language codes to only include those that have training data
+    let available_codes: std::collections::HashSet<String> = training_data.iter()
+        .map(|ex| ex.lan_code.clone())
+        .collect();
+    
+    let mut filtered_language_codes: Vec<String> = language_codes.into_iter()
+        .filter(|code| available_codes.contains(code))
+        .collect();
+    filtered_language_codes.sort();
+    
+    println!("Found {} languages with single-word training data", filtered_language_codes.len());
 
-    // Configure training with multithreading
+    // Configure training with egalitarian sampling
     let config = TrainingConfig {
         learning_rate: 0.01,
-        epochs: 200,
+        epochs: 10000,
         regularization: 0.001,
-        dimension: 4096,
+        dimension: 64,
         train_test_split: 0.8,
         batch_size: 64,
         early_stopping_patience: 20,
-        num_threads: num_cpus::get(), // Use all available cores
+        samples_per_language: 1000, // Equal single words for all languages
     };
 
     // Create and train model
-    let mut trainer = LanguageDetectorTrainer::new(language_codes, language_names, config);
+    let mut trainer = LanguageDetectorTrainer::new(filtered_language_codes, language_names, config);
     trainer.print_language_stats(&training_data);
     
-    println!("\nStarting parallel training...");
+    println!("\nStarting egalitarian training on single words...");
     trainer.train(&training_data);
     
     // Export results
-    trainer.export_weights("weights.rs")?;
+    trainer.export_weights("../../cpp/weights_single_words_64.hpp")?;
     
-    println!("Training completed successfully!");
+    println!("Single-word egalitarian training completed successfully!");
     Ok(())
 }
 
-// Helper function to load language mappings
-fn load_language_mappings(file_path: &str) -> Result<HashMap<String, String>, Box<dyn Error>> {
+// Helper function to load language codes from text file
+fn load_language_codes(file_path: &str) -> Result<Vec<String>, Box<dyn Error>> {
     let file_content = std::fs::read_to_string(file_path)?;
-    let mappings: HashMap<String, String> = serde_json::from_str(&file_content)?;
-    Ok(mappings)
+    let codes: Vec<String> = file_content
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    
+    println!("Loaded {} language codes from {}", codes.len(), file_path);
+    Ok(codes)
 }

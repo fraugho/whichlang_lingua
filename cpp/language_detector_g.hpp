@@ -8,7 +8,7 @@
 #include <functional>
 #include <cctype>
 #include <cstdint>
-#include "weights_4096.hpp"
+#include "weights_g_4096.hpp"
 
 class LanguageDetector {
 private:

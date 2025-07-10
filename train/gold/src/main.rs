@@ -1,12 +1,11 @@
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, read_dir};
 use std::io::{BufRead, BufReader, Write};
 use std::error::Error;
 use std::time::Instant;
+use std::path::Path;
 use rand::seq::SliceRandom;
 use rand::rng;
-use csv::Reader;
-use rand::prelude::IndexedRandom;
 use rand::prelude::IndexedMutRandom;
 
 // Configuration for training
@@ -19,7 +18,7 @@ pub struct TrainingConfig {
     pub train_test_split: f32, // 0.8 means 80% training, 20% testing
     pub batch_size: usize,
     pub early_stopping_patience: usize,
-    pub samples_per_language: usize, // New: equal samples per language
+    pub samples_per_language: usize,
 }
 
 impl Default for TrainingConfig {
@@ -32,13 +31,13 @@ impl Default for TrainingConfig {
             train_test_split: 0.8,
             batch_size: 32,
             early_stopping_patience: 10,
-            samples_per_language: 1000, // Default to 1000 samples per language
+            samples_per_language: 1000,
         }
     }
 }
 
 // Training example
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct TrainingExample {
     pub id: u32,
     pub lan_code: String,
@@ -194,15 +193,67 @@ impl LanguageDetectorTrainer {
         }
     }
 
-    // Load training data from CSV
-    pub fn load_csv_data(file_path: &str) -> Result<Vec<TrainingExample>, Box<dyn Error>> {
-        let mut file = Reader::from_path(file_path)?;
+    // NEW: Load training data from folder structure
+    pub fn load_folder_data(base_path: &str) -> Result<Vec<TrainingExample>, Box<dyn Error>> {
         let mut examples = Vec::new();
-        for result in file.deserialize() {
-            let record: TrainingExample = result?;
-            examples.push(record);
+        let mut id_counter = 0u32;
+        
+        // Define the subdirectories to search
+        let subdirs = ["sentences", "word-pairs", "single-words"];
+        
+        for subdir in &subdirs {
+            let dir_path = Path::new(base_path).join(subdir);
+            println!("Loading data from: {}", dir_path.display());
+            
+            if !dir_path.exists() {
+                println!("Warning: Directory {} does not exist, skipping", dir_path.display());
+                continue;
+            }
+            
+            // Read all .txt files in this subdirectory
+            for entry in read_dir(&dir_path)? {
+                let entry = entry?;
+                let file_path = entry.path();
+                
+                if let Some(extension) = file_path.extension() {
+                    if extension == "txt" {
+                        if let Some(file_stem) = file_path.file_stem() {
+                            if let Some(lang_code) = file_stem.to_str() {
+                                // Load examples from this file
+                                let file_examples = Self::load_language_file(&file_path, lang_code, &mut id_counter)?;
+                                examples.extend(file_examples.clone());
+                                println!("  Loaded {} examples from {}", 
+                                        examples.len() - (id_counter as usize - file_examples.len()), 
+                                        file_path.display());
+                            }
+                        }
+                    }
+                }
+            }
         }
-        println!("Loaded {} training examples", examples.len());
+        
+        println!("Total loaded {} training examples from {} subdirectories", examples.len(), subdirs.len());
+        Ok(examples)
+    }
+
+    // Helper function to load examples from a single language file
+    fn load_language_file(file_path: &Path, lang_code: &str, id_counter: &mut u32) -> Result<Vec<TrainingExample>, Box<dyn Error>> {
+        let file = File::open(file_path)?;
+        let reader = BufReader::new(file);
+        let mut examples = Vec::new();
+        
+        for line in reader.lines() {
+            let sentence = line?.trim().to_string();
+            if !sentence.is_empty() {
+                examples.push(TrainingExample {
+                    id: *id_counter,
+                    lan_code: lang_code.to_string(),
+                    sentence,
+                });
+                *id_counter += 1;
+            }
+        }
+        
         Ok(examples)
     }
 
@@ -290,7 +341,14 @@ impl LanguageDetectorTrainer {
         balanced_data
     }
 
-    // Extract features from text
+    // Helper function to convert language code to C++ enum name
+    fn lang_code_to_cpp_enum(code: &str) -> String {
+        // Convert language code to enum variant (capitalize first letter)
+        code.chars()
+            .enumerate()
+            .map(|(i, c)| if i == 0 { c.to_uppercase().collect::<String>() } else { c.to_string() })
+            .collect::<String>()
+    }
     pub fn extract_features(&self, text: &str) -> HashMap<u32, f32> {
         let mut feature_counts = HashMap::new();
         let mut total_features = 0u32;
@@ -502,7 +560,7 @@ impl LanguageDetectorTrainer {
         }
     }
 
-    // Export weights to Rust file
+    // Export weights to C++ header file
     pub fn export_weights(&self, output_file: &str) -> Result<(), Box<dyn Error>> {
         let mut file = File::create(output_file)?;
         
@@ -511,42 +569,49 @@ impl LanguageDetectorTrainer {
                 self.language_codes.len(), self.config.dimension)?;
         writeln!(file, "// Trained with {} samples per language (egalitarian)", 
                 self.config.samples_per_language)?;
+        writeln!(file, "#pragma once")?;
+        writeln!(file, "#include <array>")?;
+        writeln!(file, "#include <string>")?;
         writeln!(file)?;
 
         // Generate enum for languages
-        writeln!(file, "#[derive(Copy, Clone, Debug, Eq, PartialEq)]")?;
-        writeln!(file, "pub enum Lang {{")?;
+        writeln!(file, "enum class Lang {{")?;
         for code in &self.language_codes {
-            // Convert language code to enum variant (capitalize first letter)
-            let enum_name = code.chars()
-                .enumerate()
-                .map(|(i, c)| if i == 0 { c.to_uppercase().collect::<String>() } else { c.to_string() })
-                .collect::<String>();
+            let enum_name = Self::lang_code_to_cpp_enum(code);
             writeln!(file, "    {},  // {}", enum_name, 
                     self.language_names.get(code).unwrap_or(code))?;
         }
+        writeln!(file, "}};")?;
+        writeln!(file)?;
+
+        // Generate three_letter_code function
+        writeln!(file, "std::string three_letter_code(Lang language) {{")?;
+        writeln!(file, "    switch (language) {{")?;
+        for code in &self.language_codes {
+            let enum_name = Self::lang_code_to_cpp_enum(code);
+            writeln!(file, "        case Lang::{}: return \"{}\";", enum_name, code)?;
+        }
+        writeln!(file, "    }}")?;
+        writeln!(file, "    return \"unknown\";")?;
         writeln!(file, "}}")?;
         writeln!(file)?;
 
         // Generate languages array
-        writeln!(file, "pub const LANGUAGES: &[Lang] = &[")?;
+        writeln!(file, "const std::array<Lang, {}> LANGUAGES = {{", self.language_codes.len())?;
         for code in &self.language_codes {
-            let enum_name = code.chars()
-                .enumerate()
-                .map(|(i, c)| if i == 0 { c.to_uppercase().collect::<String>() } else { c.to_string() })
-                .collect::<String>();
+            let enum_name = Self::lang_code_to_cpp_enum(code);
             writeln!(file, "    Lang::{},", enum_name)?;
         }
-        writeln!(file, "];")?;
+        writeln!(file, "}};")?;
         writeln!(file)?;
 
         // Generate weights array
-        writeln!(file, "pub const WEIGHTS: &[f32] = &[")?;
+        writeln!(file, "const std::array<float, {}> WEIGHTS = {{", self.weights.len())?;
         for (i, &weight) in self.weights.iter().enumerate() {
             if i % 8 == 0 {
                 write!(file, "    ")?;
             }
-            write!(file, "{:.8}", weight)?;
+            write!(file, "{:.6}f", weight)?;
             if i < self.weights.len() - 1 {
                 write!(file, ",")?;
             }
@@ -556,19 +621,26 @@ impl LanguageDetectorTrainer {
                 write!(file, " ")?;
             }
         }
-        writeln!(file, "];")?;
+        writeln!(file, "}};")?;
         writeln!(file)?;
 
         // Generate intercepts array
-        writeln!(file, "pub const INTERCEPTS: &[f32] = &[")?;
+        writeln!(file, "const float INTERCEPTS[{}] = {{", self.intercepts.len())?;
         for (i, &intercept) in self.intercepts.iter().enumerate() {
-            write!(file, "    {:.8}", intercept)?;
+            if i % 8 == 0 {
+                write!(file, "    ")?;
+            }
+            write!(file, "{:.6}f", intercept)?;
             if i < self.intercepts.len() - 1 {
                 write!(file, ",")?;
             }
-            writeln!(file)?;
+            if i % 8 == 7 || i == self.intercepts.len() - 1 {
+                writeln!(file)?;
+            } else {
+                write!(file, " ")?;
+            }
         }
-        writeln!(file, "];")?;
+        writeln!(file, "}};")?;
 
         println!("Weights exported to {}", output_file);
         Ok(())
@@ -598,26 +670,33 @@ impl LanguageDetectorTrainer {
 
 // Main function to run training
 fn main() -> Result<(), Box<dyn Error>> {
-    // Load language mappings
-    let language_names = load_language_mappings("../dataset/lan_to_language.json")?;
+    // Load language codes from text file
+    let language_codes = load_language_codes("../../gold_codes.txt")?;
     
-    // Load training data
-    let training_data = LanguageDetectorTrainer::load_csv_data("../dataset/sentences.csv")?;
-    
-    // Get unique language codes from data
-    let mut language_codes: Vec<String> = training_data.iter()
-        .map(|ex| ex.lan_code.clone())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
+    // Create a simple mapping from codes to codes (since we only have codes)
+    let language_names: HashMap<String, String> = language_codes.iter()
+        .map(|code| (code.clone(), code.clone()))
         .collect();
-    language_codes.sort();
     
-    println!("Found {} unique languages", language_codes.len());
+    // Load training data from folder structure
+    let training_data = LanguageDetectorTrainer::load_folder_data("../../lingua/language-testdata")?;
+    
+    // Filter language codes to only include those that have training data
+    let available_codes: std::collections::HashSet<String> = training_data.iter()
+        .map(|ex| ex.lan_code.clone())
+        .collect();
+    
+    let mut filtered_language_codes: Vec<String> = language_codes.into_iter()
+        .filter(|code| available_codes.contains(code))
+        .collect();
+    filtered_language_codes.sort();
+    
+    println!("Found {} languages with training data", filtered_language_codes.len());
 
     // Configure training with egalitarian sampling
     let config = TrainingConfig {
         learning_rate: 0.01,
-        epochs: 20,
+        epochs: 1000,
         regularization: 0.001,
         dimension: 4096,
         train_test_split: 0.8,
@@ -627,22 +706,28 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     // Create and train model
-    let mut trainer = LanguageDetectorTrainer::new(language_codes, language_names, config);
+    let mut trainer = LanguageDetectorTrainer::new(filtered_language_codes, language_names, config);
     trainer.print_language_stats(&training_data);
     
     println!("\nStarting egalitarian training...");
     trainer.train(&training_data);
     
     // Export results
-    trainer.export_weights("weights_balanced.rs")?;
+    trainer.export_weights("../../cpp/weights_g_4096.hpp")?;
     
     println!("Egalitarian training completed successfully!");
     Ok(())
 }
 
-// Helper function to load language mappings
-fn load_language_mappings(file_path: &str) -> Result<HashMap<String, String>, Box<dyn Error>> {
+// Helper function to load language codes from text file
+fn load_language_codes(file_path: &str) -> Result<Vec<String>, Box<dyn Error>> {
     let file_content = std::fs::read_to_string(file_path)?;
-    let mappings: HashMap<String, String> = serde_json::from_str(&file_content)?;
-    Ok(mappings)
+    let codes: Vec<String> = file_content
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    
+    println!("Loaded {} language codes from {}", codes.len(), file_path);
+    Ok(codes)
 }

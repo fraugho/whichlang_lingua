@@ -696,9 +696,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Configure training with egalitarian sampling
     let config = TrainingConfig {
         learning_rate: 0.01,
-        epochs: 200,
+        epochs: 10000,
         regularization: 0.001,
-        dimension: 4096,
+        dimension: 64,
         train_test_split: 0.8,
         batch_size: 64,
         early_stopping_patience: 20,
@@ -713,7 +713,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     trainer.train(&training_data);
     
     // Export results
-    trainer.export_weights("../../cpp/weights_balanced.hpp")?;
+    trainer.export_weights("../../cpp/weights_64.hpp")?;
     
     println!("Egalitarian training completed successfully!");
     Ok(())

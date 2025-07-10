@@ -8,11 +8,11 @@
 #include <functional>
 #include <cctype>
 #include <cstdint>
-#include "weights_4096.hpp"
+#include "weights_64.hpp"
 
 class LanguageDetector {
 private:
-    static constexpr size_t DIMENSION = 1 << 12;  // 4096
+    static constexpr size_t DIMENSION = 1 << 6;  // 64
     static constexpr uint32_t BIGRAM_MASK = (1 << 16) - 1;
     static constexpr uint32_t TRIGRAM_MASK = (1 << 24) - 1;
     static constexpr uint32_t SEED = 3242157231u;
